@@ -36,6 +36,13 @@ rows -- this may result from concatenating multiple .csv files exported
 from a spreadsheet. The duplicate header rows are filtered out, as well
 as duplicate consecutive data rows.
 
+All rows prior to the header row are output into the resulting VBO file
+as comments. The script considers the first row with the maximal number of
+columns to be the header row. This usually works even in presence of
+non-data rows prior to the header row, as long as the number of columns
+in the data is greater than the number of columns in the non-date rows
+prior to the header.
+
 If the timestamp of two consecutive data rows exceeds 0.1 s, the script
 automatically creates intermediate data rows by interpolating between 
 the two data rows, with 0.1 second increments to simulate a 10 Hz GPS.
