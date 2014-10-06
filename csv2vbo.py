@@ -21,10 +21,11 @@ import csv
 import sys
 
 from abc import ABCMeta
-from decimal import Decimal
+from collections import OrderedDict
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timedelta, time
 from functools import partial
-from collections import OrderedDict
+from math import ceil
 
 
 class DataFrame(object):
@@ -55,27 +56,18 @@ class Converter(object):
 		self._user_map = {}
 
 		self._value_map = {
-			"satellites": lambda v: "%03d" % Decimal(v),
-			"time": lambda v: self._format_decimal_secs(Decimal(v)),
+			"satellites": lambda v: Decimal(v),
+			"time": lambda v: Decimal(v),
 			# Convert latitude and longitude to angular minutes.
-			"latitude": lambda v: "%+012.5f" % (60 * Decimal(v)),
-			"longitude": lambda v: "%+012.5f" % (-60 * Decimal(v)),
-			"velocity kmh": lambda v: "%07.3f" % Decimal(v),
-			"heading": lambda v: "%06.2f" % Decimal(v),
-			"height": lambda v: "%+09.2f" % Decimal(v),
+			"latitude": lambda v: 60 * Decimal(v),
+			"longitude": lambda v: -60 * Decimal(v),
+			"velocity kmh": lambda v: Decimal(v),
+			"heading": lambda v: Decimal(v),
+			"height": lambda v: Decimal(v),
 			# Often used user-defined channels.
-			"LatAcc": lambda v: "%+06.3f" % self._decimal_or_default(v, 0.0),
-			"LongAcc": lambda v: "%+06.3f" % self._decimal_or_default(v, 0.0),
+			"LatAcc": lambda v: self._decimal_or_default(v, 0.0),
+			"LongAcc": lambda v: self._decimal_or_default(v, 0.0),
 		}
-
-	@staticmethod
-	def _format_decimal_secs(secs):
-		int_secs = int(secs)
-		# Get relative time in seconds (without the fractional part).
-		rel_time = (datetime.min + timedelta(seconds=int_secs)).time()
-		# Round the fractional part to milliseconds.
-		int_msecs = int((secs - int_secs).shift(2).to_integral_value())
-		return "%s.%02d" % (rel_time.strftime("%H%M%S"), int_msecs)
 
 	@staticmethod
 	def _decimal_or_default(value, default):
@@ -148,7 +140,7 @@ class Converter(object):
 		base_row = []
 		if "satellites" not in vbo_head:
 			vbo_head.insert(0, "satellites")
-			base_row.append("005")
+			base_row.append(Decimal(5))
 
 		# Collect CSV-to-VBO value mappers for supported VBO data types.
 		mappers = [self._get_mapper(name) for name in vbo_names]
@@ -165,7 +157,7 @@ class Converter(object):
 				last_row = vbo_row
 
 		# Determine units for user-defined data types.
-		vbo_units={}
+		vbo_units = {}
 		for csv_name in csv_data.header():
 			if csv_name in self._user_map:
 				(vbo_name, unit) = self._user_map.get(csv_name)
@@ -218,10 +210,10 @@ class GTechFanaticConverter(Converter):
 		}
 
 		self._value_map.update({
-			"latitude": lambda v: "%+012.5f" % (Decimal(v) / 10000),
-			"longitude": lambda v: "%+012.5f" % (-Decimal(v) / 10000),
+			"latitude": lambda v: Decimal(v) / 10000,
+			"longitude": lambda v: -Decimal(v) / 10000,
 			# G-Tech flips the sign on lateral acceleration.
-			"LatAcc": lambda v: "%+06.3f" % -self._decimal_or_default(v, 0.0),
+			"LatAcc": lambda v: -self._decimal_or_default(v, 0.0),
 		})
 
 
@@ -245,8 +237,7 @@ class TrackMasterConverter(Converter):
 		}
 
 		self._value_map.update({
-			"time": lambda v:
-				self._format_decimal_secs(self._datetime_to_secs(v)),
+			"time": self._datetime_to_secs,
 		})
 
 	@staticmethod
@@ -287,6 +278,82 @@ def find_converter(data):
 			return converter
 
 	return None
+
+
+def interpolate_vbo(vbo_data, resolution):
+	def _interpolate(row_a, row_b, offset, fraction):
+		return [
+			# a + f*(b-a)
+			fraction.fma(val_b - val_a, val_a)
+			if i != time_index else val_a + offset
+			for i, (val_a, val_b) in enumerate(zip(row_a, row_b))
+		]
+
+	time_index = vbo_data.header().index("time")
+
+	new_rows = []
+	last_row = None
+	for row in vbo_data.rows():
+		next_row = [Decimal(value) for value in row]
+		if last_row is not None:
+			time_diff = next_row[time_index] - last_row[time_index]
+			for step in range(1, ceil(time_diff / resolution)):
+				offset = step * resolution
+				fraction = offset / time_diff
+				new_rows.append(
+					_interpolate(last_row, next_row, offset, fraction)
+				)
+
+		new_rows.append(row)
+		last_row = next_row
+
+	return DataFrame(
+		head=vbo_data.header(), data=new_rows,
+		info=vbo_data.comments(), units=vbo_data.units()
+	)
+
+
+def format_vbo(vbo_data):
+	def _seconds_to_hms(secs):
+		int_secs = int(secs)
+		# Get relative time in seconds (without the fractional part).
+		rel_time = (datetime.min + timedelta(seconds=int_secs)).time()
+		# Round the fractional part to milliseconds.
+		int_msecs = int((secs - int_secs).quantize(
+			# Always round halves up.
+			Decimal("0.01"), rounding=ROUND_HALF_UP
+		).shift(2))
+		return "%s.%02d" % (rel_time.strftime("%H%M%S"), int_msecs)
+
+	vbo_formatters = {
+		"satellites": lambda v: "%03d" % v,
+		"time": _seconds_to_hms,
+		"latitude": lambda v: "%+012.5f" % v,
+		"longitude": lambda v: "%+012.5f" % v,
+		"velocity kmh": lambda v: "%07.3f" % v,
+		"heading": lambda v: "%06.2f" % v,
+		"height": lambda v: "%+09.2f" % v,
+		"LatAcc": lambda v: "%+06.3f" % v,
+		"LongAcc": lambda v: "%+06.3f" % v,
+	}
+
+	# Make sure we have all the formatters we need.
+	formatters = [vbo_formatters.get(name) for name in vbo_data.header()]
+	if None in formatters:
+		raise Exception(
+			"no formatter for %s" % vbo_data.header()[formatters.index(None)]
+		)
+
+	# Format all values in all rows.
+	new_rows = [
+		[fmt(val) for (val, fmt) in zip(vbo_row, formatters)]
+		for vbo_row in vbo_data.rows()
+	]
+
+	return DataFrame(
+		head=vbo_data.header(), data=new_rows,
+		info=vbo_data.comments(), units=vbo_data.units()
+	)
 
 
 def write_vbo(vbo_data, vbo_output):
@@ -366,7 +433,7 @@ if converter is None:
 	print ("error: unable to recognize input format", file=sys.stderr)
 	sys.exit(-1)
 
-vbo_data = converter.convert(csv_data)
+vbo_data = interpolate_vbo(converter.convert(csv_data), Decimal("0.10"))
 
 with sys.stdout as vbo_output:
-	write_vbo(vbo_data, vbo_output)
+	write_vbo(format_vbo(vbo_data), vbo_output)
