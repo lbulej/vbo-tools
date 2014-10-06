@@ -25,5 +25,20 @@ of the input .csv file automatically or, failing that, exit with
 an error. For example, to convert "log.csv" into "log.vbo", the 
 following command needs to be issued:
 
-$ ./csv2vbo.py < log.csv > log.out
+$ ./csv2vbo.py < log.csv > log.vbo
 
+
+The script does not have overly strict requirements on the input .csv
+file. It has to contain a header row with column names, and from that
+point onward, only data rows with the same number of columns as the
+header row may follow. The data rows may contain duplicate header
+rows -- this may result from concatenating multiple .csv files exported
+from a spreadsheet. The duplicate header rows are filtered out, as well
+as duplicate consecutive data rows.
+
+If the timestamp of two consecutive data rows exceeds 0.1 s, the script
+automatically creates intermediate data rows by interpolating between 
+the two data rows, with 0.1 second increments to simulate a 10 Hz GPS.
+This makes working with the data in CircuitTools more reasonable (the
+software itself does not do interpolation), but it cannot supplement
+the vastly more accurate output of a 10 Hz GPS.
