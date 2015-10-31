@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# Copyright (c) 2014 Lubomir Bulej <pallas@kadan.cz>
+# Copyright (c) 2014-2015 Lubomir Bulej <pallas@kadan.cz>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -26,6 +26,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timedelta, time
 from functools import partial
 from math import ceil
+from itertools import chain
 
 
 class DataFrame(object):
@@ -43,6 +44,10 @@ class DataFrame(object):
 
 	def header(self):
 		return self._head_row
+
+	def index(self, column):
+		head_row = self._head_row
+		return head_row.index(column) if column in head_row else None
 
 	def units(self):
 		return self._head_units
@@ -64,7 +69,7 @@ class Converter(object):
 			"velocity kmh": lambda v: Decimal(v),
 			"heading": lambda v: Decimal(v),
 			"height": lambda v: Decimal(v),
-			# Often used user-defined channels.
+			# Frequently used user-defined channels.
 			"LatAcc": lambda v: self._decimal_or_default(v, 0.0),
 			"LongAcc": lambda v: self._decimal_or_default(v, 0.0),
 		}
@@ -127,8 +132,16 @@ class Converter(object):
 			if mapper is not None:
 				yield self._map_value(csv_value, mapper)
 
+	def _preprocess(self, csv_data):
+		"""Preprocesses CSV data before converting them."""
+		return csv_data
+
 	def convert(self, csv_data):
 		"""Converts a CSV data frame to VBO data frame."""
+		# Preprocess the data first - some converters may need to
+		# first sanitize the CSV before we can start value mapping.
+		csv_data = self._preprocess(csv_data)
+
 		# Map names from CSV header to VBO names (or None if unsupported).
 		vbo_names = [self._map_name(name) for name in csv_data.header()]
 
@@ -243,9 +256,108 @@ class TrackMasterConverter(Converter):
 	@staticmethod
 	def _datetime_to_secs(value):
 		full = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%f%z")
-		# Get the difference the full time and start of the corresponding day.
+		# Difference between the date and the start of the corresponding day.
 		delta = full - full.combine(full.date(), time(0, tzinfo=full.tzinfo))
 		return Decimal("%d.%d" % (delta.seconds, delta.microseconds))
+
+
+class QStarzConverter(Converter):
+
+	def __init__(self):
+		super(QStarzConverter, self).__init__()
+
+		self._header = [
+			"VALID", "LOCAL TIME", "MS",
+			"LATITUDE", "N/S", "LONGITUDE", "E/W",
+			"ALTITUDE", "SPEED", "HEADING",
+			"G-X", "G-Y"
+		]
+
+		self._base_map = {
+			"VALID": "satellites",
+			"LOCAL TIME MS": "time",
+			"LATITUDE N/S": "latitude",
+			"LONGITUDE E/W": "longitude",
+			"SPEED": "velocity kmh",
+			"HEADING": "heading",
+			"ALTITUDE": "height"
+		}
+
+		self._user_map = {
+			"G-X": ("LatAcc", "m/s2"),
+			"G-Y": ("LongAcc", "m/s2"),
+		}
+
+		self._value_map.update({
+			"satellites": lambda v: 6 if v == "FIXED" else 0,
+			"time": self._time_to_secs,
+			# QStarz flips the sign on longitudial acceleration.
+			"LongAcc": lambda v: -self._decimal_or_default(v, 0.0),
+		})
+
+	@staticmethod
+	def _time_to_secs(value):
+		full = datetime.strptime(value, "%H:%M:%S.%f")
+		# Difference between the time and start of the corresponding day.
+		delta = full - full.combine(full.date(), time(0, tzinfo=full.tzinfo))
+		return Decimal("%d.%d" % (delta.seconds, delta.microseconds))
+
+	def recognizes(self, row):
+		"""Checks whether this converter recognizes the header row."""
+		return all([item in row for item in self._header])
+
+	def _preprocess(self, csv_data):
+		"""Merges the LOCAL TIME and MS, the LATITUDE and N/S, """
+		"""and the LONGITUDE and E/W columns pairwise."""
+		# Prepare a list of indices to copy from each row.
+		col_names = chain(self._base_map.keys(), self._user_map.keys())
+		col_indices = [
+			csv_data.index(v) for v in col_names
+				if csv_data.index(v) is not None
+		]
+
+		# Cache indices to the columns that need processing
+		local_time_index = csv_data.index("LOCAL TIME")
+		local_time_ms_index = csv_data.index("MS")
+
+		latitude_index = csv_data.index("LATITUDE")
+		latitude_ns_index = csv_data.index("N/S")
+
+		longitude_index = csv_data.index("LONGITUDE")
+		longitude_ew_index = csv_data.index("E/W")
+
+		# Copy values and merge the necessary fields.
+		new_rows = []
+		for old_row in csv_data.rows():
+			new_row = [old_row[i] for i in col_indices]
+
+			# Merge LOCAL TIME and MS columns
+			new_row.extend(["%s.%s" % (
+				old_row[local_time_index], old_row[local_time_ms_index]
+			)])
+
+			# Merge LATITUDE and N/S columns, prepending N/S as +/-
+			new_row.extend(["%s%s" % (
+				"+" if old_row[latitude_ns_index] == "N" else "-",
+				old_row[latitude_index]
+			)])
+
+			# Merge LONGITUDE and E/W columns, prepending E/W as +/-
+			new_row.extend(["%s%s" % (
+				"+" if old_row[longitude_ew_index] == "E" else "-",
+				old_row[longitude_index]
+			)])
+
+			new_rows.append(new_row)
+
+		# Put together a new data frame with an updated header.
+		new_header = [csv_data.header()[i] for i in col_indices]
+		new_header.extend(["LOCAL TIME MS", "LATITUDE N/S", "LONGITUDE E/W"])
+
+		return DataFrame(
+			head=new_header, data=new_rows,
+			info=csv_data.comments(), units=csv_data.units()
+		)
 
 
 def read_csv(input):
@@ -270,7 +382,8 @@ def find_converter(data):
 	converters = (
 		RaceChronoConverter(),
 		GTechFanaticConverter(),
-		TrackMasterConverter()
+		TrackMasterConverter(),
+		QStarzConverter()
 	)
 
 	for converter in converters:

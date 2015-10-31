@@ -15,6 +15,7 @@ currently supports the following .csv variants:
   - RaceChrono
   - G-Tech Fanatic
   - TrackMaster
+  - QStarz LT6000
 
     TrackMaster .csv can be obtained by manual export
     from a .xls file (only the overview and lap sheets).
